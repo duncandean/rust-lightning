@@ -6543,7 +6543,7 @@ impl<SP: Deref> FundedChannel<SP> where
 		}
 
 		if msg.next_local_commitment_number >= INITIAL_COMMITMENT_NUMBER || msg.next_remote_commitment_number >= INITIAL_COMMITMENT_NUMBER ||
-			msg.next_local_commitment_number == 0 {
+			msg.next_local_commitment_number == 0 && msg.next_funding_txid.is_none() {
 			return Err(ChannelError::close("Peer sent an invalid channel_reestablish to force close in a non-standard way".to_owned()));
 		}
 
@@ -6672,16 +6672,19 @@ impl<SP: Deref> FundedChannel<SP> where
 					if session.unsigned_tx.compute_txid() == next_funding_txid {
 						// if it has not received tx_signatures for that funding transaction:
 						if !session.counterparty_sent_tx_signatures {
-							// MUST retransmit its commitment_signed for that funding transaction.
-							let commitment_signed = self.context.get_initial_commitment_signed(logger)?;
-							let commitment_update = Some(msgs::CommitmentUpdate {
-								commitment_signed,
-								update_add_htlcs: vec![],
-								update_fulfill_htlcs: vec![],
-								update_fail_htlcs: vec![],
-								update_fail_malformed_htlcs: vec![],
-								update_fee: None,
-							});
+							// if next_commitment_number is zero:
+							let commitment_update = if msg.next_local_commitment_number == 0 {
+								// MUST retransmit its commitment_signed for that funding transaction.
+								let commitment_signed = self.context.get_initial_commitment_signed(logger)?;
+								Some(msgs::CommitmentUpdate {
+									commitment_signed,
+									update_add_htlcs: vec![],
+									update_fulfill_htlcs: vec![],
+									update_fail_htlcs: vec![],
+									update_fail_malformed_htlcs: vec![],
+									update_fee: None,
+								})
+							} else { None };
 							// if it has already received commitment_signed and it should sign first, as specified in the tx_signatures requirements:
 							if session.received_commitment_signed && session.holder_sends_tx_signatures_first {
 								// MUST send its tx_signatures for that funding transaction.
@@ -6703,7 +6706,18 @@ impl<SP: Deref> FundedChannel<SP> where
 					// TODO(dual_funding): Should probably error here (or send tx_abort) but not in spec.
 					(None, None, None)
 				}
-			} else { (None, None, None) };
+			} else {
+				// if `next_funding_txid` is not set, and `next_commitment_number` is zero:
+				if msg.next_local_commitment_number == 0 {
+					// MUST immediately fail the channel and broadcast any relevant latest commitment transaction.
+					return Err(ChannelError::close(format!(
+						"Peer attempted to reestablish channel expecting a future local commitment transaction: {} (received) vs {} (expected)",
+						msg.next_remote_commitment_number,
+						our_commitment_transaction
+					)));
+				}
+				(None, None, None)
+			};
 
 			Ok(ReestablishResponses {
 				channel_ready, shutdown_msg, announcement_sigs,
