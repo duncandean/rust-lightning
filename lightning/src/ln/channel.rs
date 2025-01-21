@@ -4419,6 +4419,9 @@ pub(super) struct FundedChannel<SP: Deref> where SP::Target: SignerProvider {
 	pub context: ChannelContext<SP>,
 	pub interactive_tx_signing_session: Option<InteractiveTxSigningSession>,
 	holder_commitment_point: HolderCommitmentPoint,
+	/// Indicates whether this funded channel had been established with V2 channel
+	/// establishment (i.e. is a dual-funded channel).
+	is_v2_established: Option<()>,
 }
 
 #[cfg(any(test, fuzzing))]
@@ -5913,7 +5916,7 @@ impl<SP: Deref> FundedChannel<SP> where
 	pub fn tx_signatures<L: Deref>(&mut self, msg: &msgs::TxSignatures, logger: &L) -> Result<Option<msgs::TxSignatures>, ChannelError>
 		where L::Target: Logger
 	{
-		if !matches!(self.context.channel_state, ChannelState::FundingNegotiated) {
+		if !matches!(self.context.channel_state, ChannelState::AwaitingChannelReady(_)) {
 			return Err(ChannelError::close("Received tx_signatures in strange state!".to_owned()));
 		}
 
@@ -6166,12 +6169,12 @@ impl<SP: Deref> FundedChannel<SP> where
 		assert!(self.context.channel_state.is_monitor_update_in_progress());
 		self.context.channel_state.clear_monitor_update_in_progress();
 
-		// If we're past (or at) the AwaitingChannelReady stage on an outbound channel, try to
-		// (re-)broadcast the funding transaction as we may have declined to broadcast it when we
+		// If we're past (or at) the AwaitingChannelReady stage on an outbound (or V2-established) channel,
+		// try to (re-)broadcast the funding transaction as we may have declined to broadcast it when we
 		// first received the funding_signed.
 		let mut funding_broadcastable = None;
 		if let Some(funding_transaction) = &self.context.funding_transaction {
-			if self.context.is_outbound() &&
+			if (self.context.is_outbound() || self.is_v2_established()) &&
 				(matches!(self.context.channel_state, ChannelState::AwaitingChannelReady(flags) if !flags.is_set(AwaitingChannelReadyFlags::WAITING_FOR_BATCH)) ||
 				matches!(self.context.channel_state, ChannelState::ChannelReady(_)))
 			{
@@ -8461,6 +8464,10 @@ impl<SP: Deref> FundedChannel<SP> where
 			})
 			.chain(self.context.pending_outbound_htlcs.iter().map(|htlc| (&htlc.source, &htlc.payment_hash)))
 	}
+
+	pub fn is_v2_established(&self) -> bool {
+		self.is_v2_established.is_some()
+	}
 }
 
 /// A not-yet-funded outbound (from holder) channel using V1 channel establishment.
@@ -8724,6 +8731,7 @@ impl<SP: Deref> OutboundV1Channel<SP> where SP::Target: SignerProvider {
 		let mut channel = FundedChannel {
 			context: self.context,
 			interactive_tx_signing_session: None,
+			is_v2_established: None,
 			holder_commitment_point,
 		};
 
@@ -8989,6 +8997,7 @@ impl<SP: Deref> InboundV1Channel<SP> where SP::Target: SignerProvider {
 		let mut channel = FundedChannel {
 			context: self.context,
 			interactive_tx_signing_session: None,
+			is_v2_established: None,
 			holder_commitment_point,
 		};
 		let need_channel_ready = channel.check_get_channel_ready(0, logger).is_some()
@@ -9350,6 +9359,7 @@ impl<SP: Deref> PendingV2Channel<SP> where SP::Target: SignerProvider {
 		let channel = FundedChannel {
 			context: self.context,
 			interactive_tx_signing_session: Some(signing_session),
+			is_v2_established: Some(()),
 			holder_commitment_point,
 		};
 
@@ -9811,6 +9821,7 @@ impl<SP: Deref> Writeable for FundedChannel<SP> where SP::Target: SignerProvider
 			(49, self.context.local_initiated_shutdown, option), // Added in 0.0.122
 			(51, is_manual_broadcast, option), // Added in 0.0.124
 			(53, funding_tx_broadcast_safe_event_emitted, option), // Added in 0.0.124
+			(55, self.is_v2_established, option), // Added in 0.2
 		});
 
 		Ok(())
@@ -10124,6 +10135,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 		let mut cur_holder_commitment_point_opt: Option<PublicKey> = None;
 		let mut next_holder_commitment_point_opt: Option<PublicKey> = None;
 		let mut is_manual_broadcast = None;
+		let mut is_v2_established: Option<()> = None;
 
 		read_tlv_fields!(reader, {
 			(0, announcement_sigs, option),
@@ -10160,6 +10172,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 			(49, local_initiated_shutdown, option),
 			(51, is_manual_broadcast, option),
 			(53, funding_tx_broadcast_safe_event_emitted, option),
+			(55, is_v2_established, option),
 		});
 
 		let (channel_keys_id, holder_signer) = if let Some(channel_keys_id) = channel_keys_id {
@@ -10430,6 +10443,7 @@ impl<'a, 'b, 'c, ES: Deref, SP: Deref> ReadableArgs<(&'a ES, &'b SP, u32, &'c Ch
 				next_funding_txid: None,
 			},
 			interactive_tx_signing_session: None,
+			is_v2_established,
 			holder_commitment_point,
 		})
 	}
